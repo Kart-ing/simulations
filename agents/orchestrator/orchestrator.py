@@ -119,35 +119,55 @@ class OrchestratorAgent:
         # Workflow history
         self.workflows: List[Dict[str, Any]] = []
         
-        # Register in Flux as SPENDER
+        # Register in Flux as SPENDER and get/set budget
         if register_in_flux:
             try:
-                register_agent_in_flux(
-                    agent_id=self.agent_id,
-                    agent_name=self.agent_id,
-                    agent_type="Orchestrator",
-                    display_name="AI Orchestrator (Generalized Agent)",
-                    categories=["Orchestration", "Coordination", "Management"],
-                    hourly_rate=None  # Orchestrator doesn't charge, it pays
-                )
-                
-                # Update agent type to "spender" after registration
+                # First check if agent already exists to get current balance
                 from integrations.flux_integration import get_flux_integration
                 flux = get_flux_integration()
-                if flux.supabase:
-                    # Find agent and update to spender type
-                    result = flux.supabase.table('agents').select('id').eq('name', self.agent_id).execute()
-                    if result.data:
-                        agent_uuid = result.data[0]['id']
-                        flux.supabase.table('agents').update({
-                            'type': 'spender',  # Change to spender
-                            'balance': self.budget_cents,  # Set initial budget
-                            'updated_at': datetime.now().isoformat() + 'Z'
-                        }).eq('id', agent_uuid).execute()
-                        print(f"✅ Registered orchestrator as SPENDER with ${budget:.2f} budget")
+                existing_stats = get_agent_dashboard_stats(self.agent_id)
+                
+                if existing_stats and 'balance' in existing_stats:
+                    # Agent exists - use balance from database
+                    self.budget_cents = existing_stats['balance']
+                    self.spent_cents = existing_stats.get('total_spent', 0)
+                    print(f"✅ Loaded orchestrator from DB - Balance: ${self.budget_cents/100:.2f}")
+                else:
+                    # New agent - register with default budget
+                    self.budget_cents = int(budget * 100)
+                    self.spent_cents = 0
+                    
+                    register_agent_in_flux(
+                        agent_id=self.agent_id,
+                        agent_name=self.agent_id,
+                        agent_type="Orchestrator",
+                        display_name="AI Orchestrator (Generalized Agent)",
+                        categories=["Orchestration", "Coordination", "Management"],
+                        hourly_rate=None  # Orchestrator doesn't charge, it pays
+                    )
+                    
+                    # Update agent type to "spender" after registration
+                    if flux.supabase:
+                        # Find agent and update to spender type
+                        result = flux.supabase.table('agents').select('id').eq('name', self.agent_id).execute()
+                        if result.data:
+                            agent_uuid = result.data[0]['id']
+                            flux.supabase.table('agents').update({
+                                'type': 'spender',  # Change to spender
+                                'balance': self.budget_cents,  # Set initial budget
+                                'updated_at': datetime.now().isoformat() + 'Z'
+                            }).eq('id', agent_uuid).execute()
+                            print(f"✅ Registered orchestrator as SPENDER with ${budget:.2f} budget")
                 
             except Exception as e:
                 print(f"⚠️  Could not register orchestrator in Flux: {e}")
+                # Fallback to default budget
+                self.budget_cents = int(budget * 100)
+                self.spent_cents = 0
+        else:
+            # Not registering in Flux - use default budget
+            self.budget_cents = int(budget * 100)
+            self.spent_cents = 0
     
     # ==================== ORCHESTRATION TOOLS ====================
     
@@ -177,19 +197,40 @@ class OrchestratorAgent:
     
     def check_budget(self) -> str:
         """
-        Check current budget status.
+        Check current budget status (pulls latest from database).
         
         Returns:
             JSON string with budget information
         """
-        remaining = self.budget_cents - self.spent_cents
-        return json.dumps({
-            "total_budget": f"${self.budget_cents/100:.2f}",
-            "spent": f"${self.spent_cents/100:.2f}",
-            "remaining": f"${remaining/100:.2f}",
-            "remaining_cents": remaining,
-            "can_spend": remaining > 0
-        }, indent=2)
+        try:
+            # Get latest stats from database
+            stats = get_agent_dashboard_stats(self.agent_id)
+            if stats and 'balance' in stats:
+                self.budget_cents = stats['balance'] + stats.get('total_spent', 0)
+                self.spent_cents = stats.get('total_spent', 0)
+                remaining = stats['balance']
+            else:
+                # Fallback to local tracking
+                remaining = self.budget_cents - self.spent_cents
+            
+            return json.dumps({
+                "total_budget": f"${self.budget_cents/100:.2f}",
+                "spent": f"${self.spent_cents/100:.2f}",
+                "remaining": f"${remaining/100:.2f}",
+                "remaining_cents": remaining,
+                "can_spend": remaining > 0
+            }, indent=2)
+        except Exception as e:
+            # Fallback to local tracking on error
+            remaining = self.budget_cents - self.spent_cents
+            return json.dumps({
+                "total_budget": f"${self.budget_cents/100:.2f}",
+                "spent": f"${self.spent_cents/100:.2f}",
+                "remaining": f"${remaining/100:.2f}",
+                "remaining_cents": remaining,
+                "can_spend": remaining > 0,
+                "note": f"Using local tracking (DB error: {str(e)})"
+            }, indent=2)
     
     async def hire_agent(
         self,
@@ -249,11 +290,31 @@ class OrchestratorAgent:
                 auto_charge=True
             )
             
-            # Update spent amount
+            # Update spent amount and record transaction
             if result.get('status') == 'success':
                 # Parse earnings from result
                 earnings_str = result.get('earnings', '$0.00')
                 earnings_cents = int(float(earnings_str.replace('$', '')) * 100)
+                
+                # Record spending in Flux (orchestrator pays the agent)
+                try:
+                    # Get the actual agent ID from the instance
+                    recipient_agent_id = agent.agent_id if hasattr(agent, 'agent_id') else f"{agent_type}-001"
+                    
+                    record_agent_spending(
+                        agent_id=self.agent_id,
+                        recipient_id=recipient_agent_id,
+                        amount_cents=earnings_cents,
+                        service_description=f"{agent_type}: {task_description[:100]}",
+                        task_details={
+                            'agent_type': agent_type,
+                            'task': task_description,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                    )
+                except Exception as e:
+                    print(f"⚠️  Could not record spending transaction: {e}")
+                
                 self.spent_cents += earnings_cents
                 
                 print(f"   ✅ Task completed! Cost: ${earnings_cents/100:.2f}")
