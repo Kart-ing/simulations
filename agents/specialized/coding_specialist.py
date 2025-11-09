@@ -74,7 +74,7 @@ class CodingSpecialistAgent:
                 print(f"✅ {self.agent_id} registered in Flux as EARNER")
             except Exception as e:
                 print(f"⚠️  Could not register in Flux: {e}")
-        self.hourly_rate = hourly_rate
+        self.hourly_rate = 200
         self.model = model
         
         # Initialize Dedalus
